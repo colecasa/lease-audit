@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Lease Audit Multi-Agent Orchestrator
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Agent 1 (agent_011CaFZQQXJDwn8okgf5pR3i): Extract data from lease PDFs
-Agent 2 (agent_011CaFZ6gN3WQfpwbtET4ZKQ): Compare extracted data to rent roll
+Lease Audit Multi-Agent Orchestrator  (v2 — parallel + batched)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Phase 1 — Agent 1 runs in parallel (AGENT1_CONCURRENCY workers at a time)
+Phase 2 — Agent 2 receives AGENT2_BATCH_SIZE extractions per call
 
 Usage:
   python3 orchestrator.py --rent-roll path/to/rent_roll.xlsx
@@ -17,8 +17,10 @@ import json
 import argparse
 import re
 import time
+import threading
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import anthropic
 import openpyxl
@@ -35,12 +37,23 @@ RESIDENT_DOCS = BASE_DIR / "Resident_Documents_04-01-2026_14_59_28"
 OUTPUT_DIR    = BASE_DIR / "audit_output"
 ENV_ID_FILE   = BASE_DIR / ".audit_env_id"
 
-# ── Valid lease subfolders (anything outside these triggers a warning) ─────────
-LEASE_SUBFOLDERS = {"Lease Documents", "Signed Lease Documents"}
+# ── Tuning knobs ──────────────────────────────────────────────────────────────
+AGENT1_CONCURRENCY = 4    # parallel Agent 1 workers
+AGENT2_BATCH_SIZE  = 8    # residents per Agent 2 call
+RATE_LIMIT_WAIT    = 90   # seconds to back off on rate limit
+MAX_RETRIES        = 3
 
-# ── Rent roll: names/stems that are NOT a valid rent roll ─────────────────────
-BLOCKED_RENT_ROLL_NAMES = {"box score", "box_score", "application", "screening"}
+# ── Validation constants ──────────────────────────────────────────────────────
+LEASE_SUBFOLDERS           = {"Lease Documents", "Signed Lease Documents"}
+BLOCKED_RENT_ROLL_NAMES    = {"box score", "box_score", "application", "screening"}
 VALID_RENT_ROLL_EXTENSIONS = {".csv", ".xlsx", ".xls"}
+
+# ── Thread-safe logging ───────────────────────────────────────────────────────
+_print_lock = threading.Lock()
+
+def log(msg: str) -> None:
+    with _print_lock:
+        print(msg, flush=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -83,7 +96,6 @@ def find_lease_pdfs(resident_dir: Path) -> tuple[list[Path], list[str]]:
         if not item.is_file():
             continue
 
-        # Determine which subfolder this file lives in
         try:
             rel = item.relative_to(resident_dir)
             top_subfolder = rel.parts[0] if len(rel.parts) > 1 else None
@@ -91,7 +103,6 @@ def find_lease_pdfs(resident_dir: Path) -> tuple[list[Path], list[str]]:
             top_subfolder = None
 
         if top_subfolder in LEASE_SUBFOLDERS:
-            # Must be a PDF
             if item.suffix.lower() == ".pdf":
                 lease_pdfs.append(item)
             else:
@@ -99,8 +110,6 @@ def find_lease_pdfs(resident_dir: Path) -> tuple[list[Path], list[str]]:
                     f"  ⚠  Wrong file found in lease folder: '{item.name}' "
                     f"(expected PDF, got '{item.suffix or 'no extension'}')"
                 )
-        # Files outside lease folders are silently ignored — they're intentional
-        # (applications, IDs, income docs, screening results, etc.)
 
     return lease_pdfs, warnings
 
@@ -143,10 +152,6 @@ def upload_file(client: anthropic.Anthropic, path: Path) -> str:
     return result.id
 
 
-RATE_LIMIT_RETRY_WAIT = 90   # seconds to wait before retrying a rate-limited session
-MAX_RETRIES = 3
-
-
 def run_agent_session(
     client: anthropic.Anthropic,
     agent_id: str,
@@ -154,8 +159,7 @@ def run_agent_session(
     prompt: str,
     resources: list[dict],
     label: str,
-    log_fn: callable = print,
-    stream_to_stdout: bool = True,
+    stream_to_stdout: bool = False,
 ) -> str:
     for attempt in range(1, MAX_RETRIES + 1):
         session = client.beta.sessions.create(
@@ -194,7 +198,7 @@ def run_agent_session(
                         rate_limited = True
                     else:
                         err_msg = getattr(event.error, "message", str(event))
-                        log_fn(f"Error in {label}: {err_msg}")
+                        log(f"  ✗ Error in {label}: {err_msg}")
                     break
 
         try:
@@ -204,11 +208,11 @@ def run_agent_session(
 
         if rate_limited:
             if attempt < MAX_RETRIES:
-                log_fn(f"⏳ Rate limited — waiting {RATE_LIMIT_RETRY_WAIT}s then retrying ({attempt}/{MAX_RETRIES - 1})…")
-                time.sleep(RATE_LIMIT_RETRY_WAIT)
+                log(f"  ⏳ [{label}] Rate limited — waiting {RATE_LIMIT_WAIT}s (attempt {attempt}/{MAX_RETRIES})…")
+                time.sleep(RATE_LIMIT_WAIT)
                 continue
             else:
-                log_fn(f"✗ Rate limited after {MAX_RETRIES} attempts — giving up on {label}")
+                log(f"  ✗ [{label}] Rate limited after {MAX_RETRIES} attempts — giving up")
                 return ""
 
         return "".join(output_parts)
@@ -217,106 +221,170 @@ def run_agent_session(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Per-resident pipeline
+# Phase 1: Parallel Agent 1 extraction
 # ══════════════════════════════════════════════════════════════════════════════
 
-def process_resident(
+def extract_one_resident(
     client: anthropic.Anthropic,
     env_id: str,
-    rent_roll_file_id: str,
     resident_dir: Path,
 ) -> dict:
+    """Upload lease PDF and run Agent 1. Returns a result dict."""
     name = resident_dir.name
-    print(f"\n{'─'*60}")
-    print(f"  Resident: {name}")
+    lease_pdfs, warnings = find_lease_pdfs(resident_dir)
 
-    lease_pdfs, file_warnings = find_lease_pdfs(resident_dir)
-
-    for w in file_warnings:
-        print(w)
+    for w in warnings:
+        log(w)
 
     if not lease_pdfs:
-        print("  ⚠  No lease PDFs found in 'Lease Documents' or 'Signed Lease Documents' — skipping")
+        log(f"  ⚠  [{name}] No lease PDFs found — skipping")
         return {"resident": name, "skipped": True, "reason": "no lease PDFs"}
 
-    # Upload only the primary lease PDF (100-page API limit per session)
     primary_pdf = lease_pdfs[0]
     if len(lease_pdfs) > 1:
-        print(f"  ℹ  {len(lease_pdfs)} lease PDFs found — uploading primary: {primary_pdf.name}")
-    resources_a1 = []
-    uploaded_ids = []
-    file_id = upload_file(client, primary_pdf)
-    uploaded_ids.append(file_id)
-    resources_a1.append({
+        log(f"  ℹ  [{name}] {len(lease_pdfs)} lease PDFs found — using {primary_pdf.name}")
+
+    try:
+        file_id = upload_file(client, primary_pdf)
+        log(f"  ↑ [{name}] Uploaded {primary_pdf.name}")
+    except Exception as e:
+        log(f"  ✗ [{name}] Upload failed: {e}")
+        return {"resident": name, "error": str(e)}
+
+    resources = [{
         "type": "file",
         "file_id": file_id,
         "mount_path": f"/workspace/{primary_pdf.name}",
-    })
-    print(f"  ↑ Uploaded lease: {primary_pdf.name}")
+    }]
 
-    # ── Agent 1: extract lease terms ──────────────────────────────────────────
-    print(f"\n  [Agent 1] Extracting lease data...")
     a1_prompt = (
         f"Resident: {name}\n\n"
-        "Extract all key lease terms from the uploaded PDF(s). "
+        "Extract all key lease terms from the uploaded PDF. "
         "Return ONLY a JSON object with these fields:\n"
         "  unit_number, resident_name, lease_start, lease_end,\n"
         "  monthly_rent, security_deposit, late_fee, pet_fee,\n"
         "  parking_fee, utility_charges, other_charges (array of {name, amount}),\n"
         "  total_monthly_charges, special_concessions (array of {description, amount})\n\n"
-        "Use null for any field not found. Do not include any explanation, only JSON."
+        "Use null for any field not found. JSON only, no explanation."
     )
+
+    log(f"  [A1] [{name}] Extracting...")
     extraction = run_agent_session(
-        client, AGENT_1_ID, env_id, a1_prompt, resources_a1, label="Agent1"
+        client, AGENT_1_ID, env_id, a1_prompt, resources, label=f"A1/{name}"
     )
 
-    for fid in uploaded_ids:
+    try:
+        client.beta.files.delete(file_id)
+    except Exception:
+        pass
+
+    if not extraction.strip():
+        log(f"  ⚠  [{name}] Agent 1 returned no output")
+        return {"resident": name, "extraction": "", "comparison": ""}
+
+    log(f"  ✓ [{name}] Extraction complete")
+    return {"resident": name, "extraction": extraction, "comparison": None}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 2: Batched Agent 2 comparison
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _extract_json_array(text: str) -> list:
+    """Pull the first JSON array out of agent output text."""
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match:
         try:
-            client.beta.files.delete(fid)
-        except Exception:
+            result = json.loads(match.group())
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
             pass
+    return []
 
-    # Skip Agent 2 if Agent 1 produced no usable extraction
-    if not extraction.strip() or "error" in extraction.lower()[:50]:
-        print("\n\n  ⚠  Agent 1 produced no output — skipping Agent 2")
-        return {"resident": name, "extraction": extraction, "comparison": ""}
 
-    # Brief cooldown between Agent 1 and Agent 2
-    print("  ⏳ Cooling down 60s before Agent 2...")
-    time.sleep(60)
+def compare_batch(
+    client: anthropic.Anthropic,
+    env_id: str,
+    rent_roll_file_id: str,
+    batch: list[dict],
+) -> None:
+    """
+    Run Agent 2 on a batch of residents.
+    Updates each result dict's 'comparison' key in-place.
+    """
+    # Number each entry so we can reliably match output back to input
+    indexed = [
+        {"index": i, "resident": r["resident"], "extraction": r.get("extraction", "")}
+        for i, r in enumerate(batch)
+    ]
 
-    # ── Agent 2: compare to rent roll ─────────────────────────────────────────
-    print(f"\n  [Agent 2] Comparing to rent roll...")
-    a2_prompt = (
-        f"Resident: {name}\n\n"
-        f"=== Lease Extraction ===\n{extraction}\n\n"
-        "=== Task ===\n"
-        "The file at /workspace/rent_roll is the property rent roll. "
-        "Find this resident's record and compare every charge and date "
-        "from the lease extraction against what the rent roll shows.\n\n"
-        "Return ONLY a JSON object with:\n"
-        "  resident (string),\n"
-        "  unit_number (string),\n"
-        "  discrepancies (array — each item: {field, lease_value, rent_roll_value, "
-        "severity (high|medium|low), notes}),\n"
-        "  summary (one sentence — or 'No discrepancies found')\n\n"
-        "Do not include any explanation outside the JSON."
+    prompt = (
+        "Compare each resident's lease data against the property rent roll "
+        "at /workspace/rent_roll.\n\n"
+        "=== Lease Extractions ===\n"
+        + json.dumps(indexed, indent=2) +
+        "\n\n=== Instructions ===\n"
+        "For each resident, find their record in the rent roll and compare every "
+        "charge and date from their lease extraction against what the rent roll shows.\n\n"
+        "Return ONLY a JSON array — one object per resident — in this exact format:\n"
+        "[\n"
+        "  {\n"
+        "    \"index\": <same index number from input>,\n"
+        "    \"resident\": <exact resident string from input>,\n"
+        "    \"unit_number\": <string>,\n"
+        "    \"discrepancies\": [\n"
+        "      {\"field\": ..., \"lease_value\": ..., \"rent_roll_value\": ..., "
+        "\"severity\": \"high|medium|low\", \"notes\": ...}\n"
+        "    ],\n"
+        "    \"summary\": <one sentence, or 'No discrepancies found'>\n"
+        "  }\n"
+        "]\n\n"
+        "JSON array only. No text before or after it."
     )
-    rent_roll_resource = [{
+
+    resources = [{
         "type": "file",
         "file_id": rent_roll_file_id,
         "mount_path": "/workspace/rent_roll",
     }]
-    comparison = run_agent_session(
-        client, AGENT_2_ID, env_id, a2_prompt, rent_roll_resource, label="Agent2"
+
+    log(f"\n  [A2] Comparing batch of {len(batch)} residents...")
+    raw = run_agent_session(
+        client, AGENT_2_ID, env_id, prompt, resources, label=f"A2/batch"
     )
 
-    print("\n")
-    return {
-        "resident": name,
-        "extraction": extraction,
-        "comparison": comparison,
-    }
+    if not raw.strip():
+        log("  ⚠  Agent 2 returned nothing for this batch")
+        for r in batch:
+            r["comparison"] = ""
+        return
+
+    comparisons = _extract_json_array(raw)
+
+    if not comparisons:
+        log("  ⚠  Could not parse Agent 2 batch response as JSON array — storing raw")
+        for r in batch:
+            r["comparison"] = raw
+        return
+
+    # Match by index first, fall back to name substring match
+    by_index = {c.get("index", i): c for i, c in enumerate(comparisons)}
+
+    for i, result in enumerate(batch):
+        comp = by_index.get(i)
+        if not comp:
+            # Fallback: partial name match
+            comp = next(
+                (c for c in comparisons
+                 if result["resident"].lower() in str(c.get("resident", "")).lower()
+                 or str(c.get("resident", "")).lower() in result["resident"].lower()),
+                None
+            )
+        result["comparison"] = json.dumps(comp) if comp else ""
+
+    matched = sum(1 for r in batch if r.get("comparison"))
+    log(f"  ✓ Batch done — {matched}/{len(batch)} residents matched")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -324,13 +392,13 @@ def process_resident(
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Colour palette
-CLR_HEADER    = "1F3864"   # dark navy
-CLR_HIGH      = "FF4444"   # red
-CLR_MEDIUM    = "FFA500"   # orange
-CLR_LOW       = "FFD700"   # yellow
-CLR_OK        = "70AD47"   # green
-CLR_ROW_ALT   = "EEF2F7"   # light blue-grey alternate row
-CLR_TAB_HEAD  = "2E75B6"   # mid-blue subheader
+CLR_HEADER    = "1F3864"
+CLR_HIGH      = "FF4444"
+CLR_MEDIUM    = "FFA500"
+CLR_LOW       = "FFD700"
+CLR_OK        = "70AD47"
+CLR_ROW_ALT   = "EEF2F7"
+CLR_TAB_HEAD  = "2E75B6"
 
 SEVERITY_CLR  = {"high": CLR_HIGH, "medium": CLR_MEDIUM, "low": CLR_LOW}
 
@@ -342,6 +410,15 @@ def _scalar(v):
     if isinstance(v, (dict, list)):
         return json.dumps(v)
     return v
+
+
+def _safe_excel(val):
+    """Convert a value to an Excel-compatible type (str/int/float/bool or empty string)."""
+    if val is None:
+        return ""
+    if isinstance(val, (str, int, float, bool)):
+        return val
+    return str(val)
 
 
 def _hdr_font(bold=True, color="FFFFFF", size=11):
@@ -357,7 +434,7 @@ def _thin_border() -> Border:
     return Border(left=s, right=s, top=s, bottom=s)
 
 
-def _set_col_widths(ws, widths: dict[str, int]) -> None:
+def _set_col_widths(ws, widths: dict) -> None:
     for col_letter, width in widths.items():
         ws.column_dimensions[col_letter].width = width
 
@@ -380,15 +457,6 @@ def _parse_discrepancies(comparison_text: str) -> tuple[dict, list[dict]]:
     if not isinstance(discs, list):
         discs = []
     return obj, discs
-
-
-def _safe_excel(val):
-    """Convert a value to an Excel-compatible type (str/int/float/bool or empty string)."""
-    if val is None:
-        return ""
-    if isinstance(val, (str, int, float, bool)):
-        return val
-    return str(val)
 
 
 def build_excel_report(results: list[dict], output_path: Path) -> None:
@@ -438,7 +506,6 @@ def build_excel_report(results: list[dict], output_path: Path) -> None:
             if alt_fill:
                 cell.fill = alt_fill
 
-            # Colour status cell
             if col_idx == 7 and isinstance(value, str):
                 if value == "Clean":
                     cell.font = Font(bold=True, color=CLR_OK)
@@ -447,7 +514,6 @@ def build_excel_report(results: list[dict], output_path: Path) -> None:
                 else:
                     cell.font = Font(italic=True, color="888888")
 
-            # Colour severity counts
             if col_idx == 3 and isinstance(value, int) and value > 0:
                 cell.font = Font(bold=True, color=CLR_HIGH)
             if col_idx == 4 and isinstance(value, int) and value > 0:
@@ -479,17 +545,17 @@ def build_excel_report(results: list[dict], output_path: Path) -> None:
         if result.get("skipped") or result.get("error"):
             continue
         comp_obj, discs = _parse_discrepancies(result.get("comparison", ""))
-        unit = comp_obj.get("unit_number", "")
+        unit = _safe_excel(comp_obj.get("unit_number", ""))
         for d in discs:
             sev = str(d.get("severity", "")).lower()
             row_data = [
-                result["resident"],
+                _safe_excel(result["resident"]),
                 unit,
-                d.get("field", ""),
-                d.get("lease_value", ""),
-                d.get("rent_roll_value", ""),
+                _safe_excel(d.get("field", "")),
+                _safe_excel(d.get("lease_value", "")),
+                _safe_excel(d.get("rent_roll_value", "")),
                 sev.capitalize(),
-                d.get("notes", ""),
+                _safe_excel(d.get("notes", "")),
             ]
             ws_disc.append(row_data)
             sev_color = SEVERITY_CLR.get(sev, "FFFFFF")
@@ -499,7 +565,6 @@ def build_excel_report(results: list[dict], output_path: Path) -> None:
                 cell.alignment = Alignment(vertical="center", wrap_text=(col_idx == 7))
                 if disc_row % 2 == 0:
                     cell.fill = _fill(CLR_ROW_ALT)
-            # Highlight severity cell
             sev_cell = ws_disc.cell(row=disc_row, column=6)
             sev_cell.fill = _fill(sev_color)
             sev_cell.font = Font(bold=True, color="FFFFFF" if sev in ("high", "medium") else "333333")
@@ -540,7 +605,7 @@ def build_excel_report(results: list[dict], output_path: Path) -> None:
         ) if isinstance(concessions, list) else str(concessions)
 
         row_data = [
-            result["resident"],
+            _safe_excel(result["resident"]),
             _scalar(ext.get("unit_number")),
             _scalar(ext.get("resident_name")),
             _scalar(ext.get("lease_start")),
@@ -598,7 +663,7 @@ def main():
     args = parser.parse_args()
 
     rent_roll_path = Path(args.rent_roll)
-    validate_rent_roll(rent_roll_path)          # exits with message if wrong file
+    validate_rent_roll(rent_roll_path)
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -608,9 +673,11 @@ def main():
     client = anthropic.Anthropic(api_key=api_key)
 
     print("═" * 60)
-    print("  Lease Audit Orchestrator")
+    print("  Lease Audit Orchestrator  (v2 — parallel + batched)")
     print("═" * 60)
-    print(f"  Rent roll : {rent_roll_path.name}")
+    print(f"  Rent roll        : {rent_roll_path.name}")
+    print(f"  A1 concurrency   : {AGENT1_CONCURRENCY} parallel workers")
+    print(f"  A2 batch size    : {AGENT2_BATCH_SIZE} residents/call")
 
     print("\n[Setup]")
     env_id = get_or_create_env(client)
@@ -624,27 +691,70 @@ def main():
     if limit:
         resident_dirs = resident_dirs[:limit]
 
-    print(f"\n[Processing {len(resident_dirs)} resident(s)]")
+    # ── Phase 1: Parallel Agent 1 ─────────────────────────────────────────────
+    print(f"\n[Phase 1 — Extracting {len(resident_dirs)} leases "
+          f"with {AGENT1_CONCURRENCY} parallel workers]")
 
-    results = []
-    for i, resident_dir in enumerate(resident_dirs):
-        try:
-            result = process_resident(client, env_id, rent_roll_file_id, resident_dir)
-            results.append(result)
-        except Exception as exc:
-            print(f"\n  ✗ Error: {exc}")
-            results.append({"resident": resident_dir.name, "error": str(exc)})
+    results_map: dict[str, dict] = {}
 
-        if i < len(resident_dirs) - 1:
-            print("  ⏳ Pausing 30s to avoid rate limits...")
-            time.sleep(30)
+    with ThreadPoolExecutor(max_workers=AGENT1_CONCURRENCY) as executor:
+        futures = {
+            executor.submit(extract_one_resident, client, env_id, d): d.name
+            for d in resident_dirs
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                log(f"  ✗ [{name}] Unhandled error: {exc}")
+                result = {"resident": name, "error": str(exc)}
+            results_map[name] = result
 
+    # Restore original directory ordering
+    results = [results_map[d.name] for d in resident_dirs if d.name in results_map]
+
+    extracted = sum(1 for r in results if r.get("extraction","").strip())
+    skipped_a1 = sum(1 for r in results if r.get("skipped"))
+    print(f"\n  Phase 1 complete — {extracted} extracted, {skipped_a1} skipped")
+
+    # ── Phase 2: Batched Agent 2 ──────────────────────────────────────────────
+    to_compare = [
+        r for r in results
+        if not r.get("skipped")
+        and not r.get("error")
+        and r.get("extraction", "").strip()
+        and r.get("comparison") is None
+    ]
+
+    batches = [
+        to_compare[i:i + AGENT2_BATCH_SIZE]
+        for i in range(0, len(to_compare), AGENT2_BATCH_SIZE)
+    ]
+
+    print(f"\n[Phase 2 — Comparing {len(to_compare)} residents "
+          f"in {len(batches)} batch(es) of up to {AGENT2_BATCH_SIZE}]")
+
+    for i, batch in enumerate(batches, 1):
+        names = ", ".join(r["resident"] for r in batch)
+        print(f"\n  Batch {i}/{len(batches)}: {names}")
+        compare_batch(client, env_id, rent_roll_file_id, batch)
+        if i < len(batches):
+            print("  Pausing 10s between batches...")
+            time.sleep(10)
+
+    # Fill in any missing comparison fields
+    for r in results:
+        if r.get("comparison") is None:
+            r["comparison"] = ""
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
     try:
         client.beta.files.delete(rent_roll_file_id)
     except Exception:
         pass
 
-    # Save JSON
+    # ── Save outputs ──────────────────────────────────────────────────────────
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     json_path  = OUTPUT_DIR / f"audit_results_{ts}.json"
     excel_path = OUTPUT_DIR / f"Lease_Audit_Report_{ts}.xlsx"
@@ -652,7 +762,7 @@ def main():
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2)
 
-    print("Building Excel report...")
+    print("\nBuilding Excel report...")
     build_excel_report(results, excel_path)
 
     processed = sum(1 for r in results if not r.get("skipped") and not r.get("error"))
