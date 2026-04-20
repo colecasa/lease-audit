@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Lease data — never commit resident documents or rent rolls
+Resident_Documents_*/
+*.pdf
+Rent Roll*.xlsx
+Rent Roll*.csv
+
+# Audit outputs
+audit_output/
+
+# Cached environment ID (machine-specific)
+.audit_env_id
+
+# Mac
+.DS_Store
