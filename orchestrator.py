@@ -382,6 +382,15 @@ def _parse_discrepancies(comparison_text: str) -> tuple[dict, list[dict]]:
     return obj, discs
 
 
+def _safe_excel(val):
+    """Convert a value to an Excel-compatible type (str/int/float/bool or empty string)."""
+    if val is None:
+        return ""
+    if isinstance(val, (str, int, float, bool)):
+        return val
+    return str(val)
+
+
 def build_excel_report(results: list[dict], output_path: Path) -> None:
     wb = openpyxl.Workbook()
 
@@ -407,8 +416,8 @@ def build_excel_report(results: list[dict], output_path: Path) -> None:
 
         if result.get("skipped") or result.get("error"):
             status = "Skipped" if result.get("skipped") else "Error"
-            row_data = [result["resident"], "", 0, 0, 0, 0, status,
-                        result.get("reason") or result.get("error", "")]
+            row_data = [_safe_excel(result["resident"]), "", 0, 0, 0, 0, status,
+                        _safe_excel(result.get("reason") or result.get("error", ""))]
         else:
             comp_obj, discs = _parse_discrepancies(result.get("comparison", ""))
             high   = sum(1 for d in discs if str(d.get("severity","")).lower() == "high")
@@ -416,9 +425,9 @@ def build_excel_report(results: list[dict], output_path: Path) -> None:
             low    = sum(1 for d in discs if str(d.get("severity","")).lower() == "low")
             total  = len(discs)
             status = "Issues Found" if total > 0 else "Clean"
-            summary = comp_obj.get("summary", "")
-            unit    = comp_obj.get("unit_number", "")
-            row_data = [result["resident"], unit, high, medium, low, total, status, summary]
+            summary = _safe_excel(comp_obj.get("summary", ""))
+            unit    = _safe_excel(comp_obj.get("unit_number", ""))
+            row_data = [_safe_excel(result["resident"]), unit, high, medium, low, total, status, summary]
 
         ws_sum.append(row_data)
 
