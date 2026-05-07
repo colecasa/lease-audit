@@ -146,9 +146,15 @@ def get_or_create_env(client: anthropic.Anthropic) -> str:
 # Agent sessions
 # ══════════════════════════════════════════════════════════════════════════════
 
+BETA_HEADER = {"anthropic-beta": "managed-agents-2026-04-01"}
+
+
 def upload_file(client: anthropic.Anthropic, path: Path) -> str:
     with open(path, "rb") as f:
-        result = client.beta.files.upload(file=f)
+        result = client.beta.files.upload(
+            file=f,
+            extra_headers=BETA_HEADER,
+        )
     return result.id
 
 

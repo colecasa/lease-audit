@@ -8,7 +8,6 @@ import json
 import os
 import sys
 import tempfile
-import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -70,6 +69,7 @@ with st.sidebar:
     st.code(f"Compare : {AGENT_2_ID}", language=None)
 
 # ── File uploads ───────────────────────────────────────────────────────────────
+# Cache uploaded file bytes in session_state so they survive the button-click rerun
 col_a, col_b = st.columns(2)
 with col_a:
     zip_upload = st.file_uploader(
@@ -77,14 +77,25 @@ with col_a:
         type=["zip"],
         help="ZIP containing resident folders with 'Lease Documents' subfolders",
     )
+    if zip_upload is not None:
+        st.session_state["zip_bytes"] = zip_upload.getvalue()
+        st.session_state["zip_name"]  = zip_upload.name
+
 with col_b:
     rr_upload = st.file_uploader(
         "📊 Rent Roll",
         type=["xlsx", "xls", "csv"],
         help="Property rent roll — .xlsx, .xls, or .csv",
     )
+    if rr_upload is not None:
+        st.session_state["rr_bytes"] = rr_upload.getvalue()
+        st.session_state["rr_name"]  = rr_upload.name
 
-can_run = bool(zip_upload and rr_upload and api_key)
+can_run = bool(
+    st.session_state.get("zip_bytes") and
+    st.session_state.get("rr_bytes") and
+    api_key
+)
 run_btn = st.button(
     "▶  Run Audit",
     disabled=not can_run,
@@ -118,12 +129,17 @@ def find_resident_dirs(extracted_root: Path) -> list[Path]:
 
 # ── Main audit ─────────────────────────────────────────────────────────────────
 if run_btn:
+    # Pull files from session state (survives the button-click rerun)
+    zip_bytes = st.session_state["zip_bytes"]
+    rr_bytes  = st.session_state["rr_bytes"]
+    rr_name   = st.session_state["rr_name"]
+
     # Validate rent roll filename before doing anything else
-    rr_stem  = Path(rr_upload.name).stem.lower()
-    rr_ext   = Path(rr_upload.name).suffix.lower()
+    rr_stem = Path(rr_name).stem.lower()
+    rr_ext  = Path(rr_name).suffix.lower()
     if any(b in rr_stem for b in BLOCKED_RENT_ROLL_NAMES) or rr_ext not in VALID_RENT_ROLL_EXTENSIONS:
         st.error(
-            f"⛔ **WRONG FILE FOUND**: '{rr_upload.name}' doesn't look like a rent roll.  \n"
+            f"⛔ **WRONG FILE FOUND**: '{rr_name}' doesn't look like a rent roll.  \n"
             f"Please upload the property rent roll (.xlsx / .xls / .csv)."
         )
         st.stop()
@@ -135,13 +151,9 @@ if run_btn:
     with tempfile.TemporaryDirectory() as _tmp:
         tmp = Path(_tmp)
 
-        # Write zip to disk in chunks (avoids loading 2.5 GB into RAM)
+        # Write zip to disk then extract
         zip_path = tmp / "leases.zip"
-        with open(zip_path, "wb") as zf_out:
-            while chunk := zip_upload.read(8 * 1024 * 1024):  # 8 MB chunks
-                zf_out.write(chunk)
-
-        # Extract from disk
+        zip_path.write_bytes(zip_bytes)
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(tmp / "leases")
 
@@ -157,10 +169,10 @@ if run_btn:
             resident_dirs = resident_dirs[:limit]
 
         # Save rent roll locally
-        rr_path = tmp / rr_upload.name
-        rr_path.write_bytes(rr_upload.read())
+        rr_path = tmp / rr_name
+        rr_path.write_bytes(rr_bytes)
 
-        st.success(f"✅ ZIP extracted — **{len(resident_dirs)}** resident(s) queued")
+        st.success(f"✅ ZIP extracted — **{len(resident_dirs)}** resident(s) queued  |  Rent roll: {rr_name}")
 
         # Environment + rent roll upload ───────────────────────────────────────
         with st.status("Setting up…", expanded=False) as setup_box:
@@ -172,44 +184,42 @@ if run_btn:
             st.write(f"Rent roll uploaded: `{rr_file_id}`")
             setup_box.update(label="✅ Setup complete", state="complete")
 
-        progress = st.progress(0, text="Starting…")
+        total_steps = len(resident_dirs) * 2   # Agent 1 + Agent 2 per resident
+        progress = st.progress(0, text="Starting Phase 1…")
+        step = 0
 
-        # ── Per-resident loop ──────────────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # PHASE 1 — Agent 1: extract lease data for every resident
+        # ══════════════════════════════════════════════════════════════════════
+        st.subheader("Phase 1 — Lease Extraction")
+        extractions: dict[str, dict] = {}   # name → {extraction, ext_obj, res_dir}
+
         for i, res_dir in enumerate(resident_dirs):
             name = res_dir.name
-            progress.progress(
-                i / len(resident_dirs),
-                text=f"Processing {name}  ({i + 1}/{len(resident_dirs)})…"
-            )
+            progress.progress(step / total_steps, text=f"Phase 1 · {name} ({i + 1}/{len(resident_dirs)})…")
 
-            with st.status(f"⏳ {name}", expanded=True) as res_status:
-                log = st.write   # st.write inside a status block writes into it
+            with st.status(f"📄 {name}", expanded=True) as s1:
+                log = st.write
 
-                # Find lease PDFs ───────────────────────────────────────────────
                 lease_pdfs, warnings = find_lease_pdfs(res_dir)
                 for w in warnings:
                     log(f"⚠️ {w}")
                     review_flags.append({"resident": name, "issue": w, "type": "warning"})
 
                 if not lease_pdfs:
-                    log("⚠️ No lease PDFs found in 'Lease Documents' / 'Signed Lease Documents' — skipping")
-                    res_status.update(label=f"⏭ {name} — No lease PDFs (skipped)", state="error")
+                    log("⚠️ No lease PDFs found — skipping")
+                    s1.update(label=f"⏭ {name} — No lease PDFs", state="error")
                     results.append({"resident": name, "skipped": True, "reason": "no lease PDFs"})
-                    review_flags.append({
-                        "resident": name,
-                        "issue": "No lease PDFs found in approved subfolders",
-                        "type": "skip",
-                    })
+                    review_flags.append({"resident": name, "issue": "No lease PDFs in approved subfolders", "type": "skip"})
+                    step += 2   # skip both agent steps
                     continue
 
-                # Upload primary PDF ────────────────────────────────────────────
                 primary = lease_pdfs[0]
                 if len(lease_pdfs) > 1:
                     log(f"ℹ️ {len(lease_pdfs)} PDFs found — uploading primary: {primary.name}")
                 log(f"⬆️ Uploading {primary.name}…")
                 fid = upload_file(client, primary)
 
-                # Agent 1 — extract ─────────────────────────────────────────────
                 log("🤖 **Agent 1**: extracting lease terms…")
                 a1_prompt = (
                     f"Resident: {name}\n\n"
@@ -227,33 +237,48 @@ if run_btn:
                     "Agent1", log_fn=log, stream_to_stdout=False,
                 )
 
-                # Clean up uploaded lease file
                 try:
                     client.beta.files.delete(fid)
                 except Exception:
                     pass
 
                 if not extraction.strip():
-                    log("❌ Agent 1 returned no output — skipping this resident")
-                    res_status.update(label=f"❌ {name} — Extraction failed", state="error")
+                    log("❌ Agent 1 returned no output")
+                    s1.update(label=f"❌ {name} — Extraction failed", state="error")
                     results.append({"resident": name, "extraction": "", "comparison": ""})
-                    review_flags.append({
-                        "resident": name,
-                        "issue": "Agent 1 extraction failed — manual review needed",
-                        "type": "error",
-                    })
+                    review_flags.append({"resident": name, "issue": "Agent 1 extraction failed — manual review needed", "type": "error"})
+                    step += 2
                     continue
 
                 ext_obj = _extract_json(extraction)
-                log(f"✅ Agent 1 done — {len(ext_obj)} fields extracted")
+                log(f"✅ Done — {len(ext_obj)} fields extracted")
                 with st.expander("Extracted lease data"):
                     st.json(ext_obj)
 
-                # Cooldown ──────────────────────────────────────────────────────
-                log("⏳ Cooling down 60 s before Agent 2…")
-                time.sleep(60)
+                s1.update(label=f"✅ {name} — Extraction complete", state="complete")
+                extractions[name] = {"extraction": extraction, "ext_obj": ext_obj, "res_dir": res_dir}
 
-                # Agent 2 — compare ─────────────────────────────────────────────
+            step += 1
+            progress.progress(step / total_steps, text=f"Phase 1 · {name} complete")
+
+        if extractions:
+            st.info(f"✅ Phase 1 complete — {len(extractions)} lease(s) extracted. Starting Agent 2…")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PHASE 2 — Agent 2: compare each extraction to the rent roll
+        # ══════════════════════════════════════════════════════════════════════
+        st.subheader("Phase 2 — Rent Roll Comparison")
+        extraction_list = list(extractions.items())
+
+        for i, (name, data) in enumerate(extraction_list):
+            extraction = data["extraction"]
+            ext_obj    = data["ext_obj"]
+
+            progress.progress(step / total_steps, text=f"Phase 2 · {name} ({i + 1}/{len(extraction_list)})…")
+
+            with st.status(f"🔍 {name}", expanded=True) as s2:
+                log = st.write
+
                 log("🤖 **Agent 2**: comparing to rent roll…")
                 a2_prompt = (
                     f"Resident: {name}\n\n"
@@ -280,45 +305,26 @@ if run_btn:
 
                 if not comparison.strip():
                     log("⚠️ Agent 2 returned no output — manual review needed")
-                    res_status.update(label=f"⚠️ {name} — Comparison failed", state="error")
-                    review_flags.append({
-                        "resident": name,
-                        "issue": "Agent 2 comparison failed — manual review needed",
-                        "type": "error",
-                    })
+                    s2.update(label=f"⚠️ {name} — Comparison failed", state="error")
+                    review_flags.append({"resident": name, "issue": "Agent 2 comparison failed — manual review needed", "type": "error"})
                 elif discs:
                     log(f"🚨 {len(discs)} discrepancy(ies) — High: {high_ct} / Med: {med_ct} / Low: {low_ct}")
                     if high_ct:
-                        review_flags.append({
-                            "resident": name,
-                            "issue": f"{high_ct} high-severity issue(s): {comp_obj.get('summary', '')}",
-                            "type": "high",
-                        })
-                    label_icon = "🚨" if high_ct else "⚠️"
-                    res_status.update(
-                        label=f"{label_icon} {name} — {len(discs)} issue(s)",
-                        state="error" if high_ct else "complete",
-                    )
+                        review_flags.append({"resident": name, "issue": f"{high_ct} high-severity issue(s): {comp_obj.get('summary', '')}", "type": "high"})
+                    icon = "🚨" if high_ct else "⚠️"
+                    s2.update(label=f"{icon} {name} — {len(discs)} issue(s)", state="error" if high_ct else "complete")
                 else:
                     log("✅ No discrepancies found")
-                    res_status.update(label=f"✅ {name} — Clean", state="complete")
+                    s2.update(label=f"✅ {name} — Clean", state="complete")
 
                 with st.expander("Comparison result"):
                     st.json(comp_obj if comp_obj else {"note": "No output from Agent 2"})
 
-                results.append({
-                    "resident": name,
-                    "extraction": extraction,
-                    "comparison": comparison,
-                })
+                results.append({"resident": name, "extraction": extraction, "comparison": comparison})
 
-            # Pause between residents (not after the last one)
-            if i < len(resident_dirs) - 1:
-                progress.progress(
-                    (i + 1) / len(resident_dirs),
-                    text="⏳ Pausing 30 s between residents…"
-                )
-                time.sleep(30)
+            step += 1
+            progress.progress(step / total_steps, text=f"Phase 2 · {name} complete")
+
 
         progress.progress(1.0, text="Audit complete!")
 

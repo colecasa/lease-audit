@@ -1,4 +1,4 @@
-anthropic
+anthropic==0.96.0
 openpyxl
 streamlit
 pandas
