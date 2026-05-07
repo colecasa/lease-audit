@@ -234,7 +234,7 @@ if run_btn:
                 extraction = run_agent_session(
                     client, AGENT_1_ID, env_id, a1_prompt,
                     [{"type": "file", "file_id": fid, "mount_path": f"/workspace/{primary.name}"}],
-                    "Agent1", log_fn=log, stream_to_stdout=False,
+                    "Agent1",
                 )
 
                 try:
@@ -295,7 +295,7 @@ if run_btn:
                 comparison = run_agent_session(
                     client, AGENT_2_ID, env_id, a2_prompt,
                     [{"type": "file", "file_id": rr_file_id, "mount_path": "/workspace/rent_roll"}],
-                    "Agent2", log_fn=log, stream_to_stdout=False,
+                    "Agent2",
                 )
 
                 comp_obj, discs = _parse_discrepancies(comparison)
